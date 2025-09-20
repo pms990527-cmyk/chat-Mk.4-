@@ -1,9 +1,10 @@
 /**
- * 1:1 Chat — Cloud Cat <-> Fox theme switch
- * - 말풍선 없음 + 텍스트 배경만(테두리 0)
- * - 테마 토글(구름 고양이 / 여우), localStorage로 기억
- * - 1:1, 방키, 읽음(1), 타이핑, 이모지(입력창 삽입), 이미지 라이트박스, 파일 전송
- * - Enter 전송, 자동 스크롤, 끊김 방지(ping + keep-alive)
+ * Multi-user Chat — Theme toggle (Cloud Cat / Fox) + Unread Count
+ * - 인원 제한 제거(몇 명이든 OK)
+ * - 읽음 표시: 각 메시지에 대해 "안 읽은 사람 수"를 서버가 관리하고 실시간 갱신
+ * - 테마(구름 고양이/여우) 토글, 이모지(입력창 삽입), 파일 전송, 이미지 라이트박스
+ * - Enter 전송, 자동 스크롤, 끊김 방지(keep-alive)
+ * - DB 없음(메모리). 재시작하면 기록 없음.
  */
 const express = require('express');
 const http = require('http');
@@ -24,11 +25,21 @@ const io = new Server(server, {
   maxHttpBufferSize: 8_000_000
 });
 
-const APP_VERSION = 'v-2025-09-21-theme-toggle';
+const APP_VERSION = 'v-2025-09-21-multi-unread-count';
 
 const rooms = new Map();
+/**
+ * room = {
+ *   key: string|null,
+ *   users: Set<socketId>,
+ *   lastMsgs: Array<{t:number, from:socketId}>   // throttle 용
+ *   unread: Map<msgId, Set<socketId>>            // 아직 안 읽은 사람들
+ * }
+ */
 function getRoom(roomId) {
-  if (!rooms.has(roomId)) rooms.set(roomId, { key: null, users: new Set(), lastMsgs: [] });
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, { key: null, users: new Set(), lastMsgs: [], unread: new Map() });
+  }
   return rooms.get(roomId);
 }
 function sanitize(str, max = 200) {
@@ -55,7 +66,6 @@ app.get('/', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Cloud Cat / Fox Chat</title>
 <style>
-  /* 공통 변수 기본값(혹시 테마 속성이 안 먹었을 때 대비) */
   :root{
     --app-bg: linear-gradient(180deg,#e0f2fe,#ffffff);
     --chat-bg: linear-gradient(180deg,#f0f9ff,#ffffff);
@@ -76,8 +86,6 @@ app.get('/', (req, res) => {
     --shadow-soft: rgba(2,6,23,.08);
     --header-h:58px;
   }
-
-  /* 구름 고양이(Cloud Cat) */
   :root[data-theme="cloud"]{
     --app-bg:
       radial-gradient(900px 500px at 15% -10%, rgba(255,255,255,.40), transparent 60%),
@@ -85,23 +93,15 @@ app.get('/', (req, res) => {
       radial-gradient(1200px 700px at 50% 120%, rgba(125,211,252,.20), transparent 60%),
       linear-gradient(180deg,#e0f2fe,#ffffff);
     --chat-bg: linear-gradient(180deg,#f0f9ff,#ffffff);
-    --card-bg: rgba(255,255,255,.86);
-    --border: rgba(14,165,233,.18);
     --accent: #0ea5e9;
     --accent-weak: #38bdf8;
-    --ink: #0f172a;
-    --muted:#64748b;
-    --meBg:#dff3ff;
-    --themBg:#ffffff;
-    --meText:#083344;
-    --themText:#0f172a;
     --avatar-bg:#bae6fd;
     --btn-emoji-bg:#bae6fd;
+    --meBg:#dff3ff; --meText:#083344;
+    --themBg:#ffffff; --themText:#0f172a;
+    --border: rgba(14,165,233,.18);
     --shadow-strong: rgba(2,132,199,.25);
-    --shadow-soft: rgba(2,6,23,.08);
   }
-
-  /* 여우(Fox) */
   :root[data-theme="fox"]{
     --app-bg:
       radial-gradient(900px 500px at 15% -10%, rgba(255,255,255,.45), transparent 60%),
@@ -109,28 +109,21 @@ app.get('/', (req, res) => {
       radial-gradient(1200px 700px at 50% 120%, rgba(253,186,116,.22), transparent 60%),
       linear-gradient(180deg,#fff5ec,#ffffff);
     --chat-bg: linear-gradient(180deg,#fff7ef,#ffffff);
-    --card-bg: rgba(255,255,255,.9);
-    --border: rgba(244,114,33,.18);
     --accent: #f97316;
     --accent-weak: #fb923c;
-    --ink: #1f2937;
-    --muted:#6b7280;
-    --meBg:#ffe8d6;
-    --themBg:#ffffff;
-    --meText:#4a2b13;
-    --themText:#1f2937;
     --avatar-bg:#fed7aa;
     --btn-emoji-bg:#fed7aa;
+    --meBg:#ffe8d6; --meText:#4a2b13;
+    --themBg:#ffffff; --themText:#1f2937;
+    --border: rgba(244,114,33,.18);
     --shadow-strong: rgba(249,115,22,.25);
-    --shadow-soft: rgba(2,6,23,.08);
   }
 
   *{box-sizing:border-box}
   html,body{height:100%}
   body{
     margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans KR",Arial;
-    color:var(--ink);
-    background: var(--app-bg);
+    color:var(--ink); background:var(--app-bg);
     -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
   }
   .wrap{max-width:740px;margin:0 auto;min-height:100%;padding:0 12px}
@@ -143,8 +136,6 @@ app.get('/', (req, res) => {
     box-shadow:0 16px 50px var(--shadow-soft), inset 0 0 0 1px rgba(255,255,255,.04);
     overflow:hidden; display:flex; flex-direction:column;
   }
-
-  /* App Bar */
   .appbar{height:var(--header-h);display:flex;align-items:center;justify-content:space-between;padding:0 12px 0 16px;background:rgba(255,255,255,.92);border-bottom:1px solid var(--border)}
   .brand{display:flex;gap:10px;align-items:center}
   .cat{width:36px;height:36px;border-radius:999px;background:var(--avatar-bg);display:flex;align-items:center;justify-content:center;box-shadow:0 0 18px var(--accent-weak)}
@@ -155,13 +146,11 @@ app.get('/', (req, res) => {
   .theme{font-size:12px;color:var(--muted)}
   .theme select{padding:4px 8px;border:1px solid var(--border);border-radius:8px;background:#fff;color:var(--ink);font:inherit}
 
-  /* Chat area */
   .chat{flex:1;min-height:0;overflow:auto;background:var(--chat-bg);padding:14px 14px 110px 14px}
   .divider{display:flex;align-items:center;gap:8px;margin:8px 0}
   .divider .line{height:1px;background:var(--border);flex:1}
   .divider .txt{font-size:12px;color:var(--accent);font-family:ui-serif, Georgia, serif}
 
-  /* Message row */
   .msg{display:flex;gap:10px;margin:10px 0;align-items:flex-end}
   .msg.me{justify-content:flex-end}
   .avatar{width:32px;height:32px;border-radius:50%;background:var(--avatar-bg);display:flex;align-items:center;justify-content:center;font-size:18px}
@@ -173,37 +162,29 @@ app.get('/', (req, res) => {
   .name{font-size:11px;color:var(--muted);margin:0 0 2px 4px}
   .msg.me .name{display:none}
 
-  /* 텍스트 배경만 */
   .content{display:flex;flex-direction:column;gap:4px}
   .text{
     display:inline-block;
-    background:var(--themBg);
-    color:var(--themText);
-    line-height:1.24;
-    word-break:break-word;
-    padding:6px 10px;
-    border-radius:12px;
+    background:var(--themBg); color:var(--themText);
+    line-height:1.24; word-break:break-word;
+    padding:6px 10px; border-radius:12px;
     box-shadow:0 2px 8px var(--shadow-soft);
   }
   .msg.me .text{
-    background:var(--meBg);
-    color:var(--meText);
+    background:var(--meBg); color:var(--meText);
     box-shadow:0 4px 12px var(--shadow-strong);
   }
 
-  /* 이미지/첨부 */
   .content img{display:block;max-width:320px;height:auto;border-radius:12px;cursor:zoom-in;box-shadow:0 12px 28px rgba(8,12,26,.18)}
   .att{font-size:12px}
   .att a{color:var(--accent);text-decoration:none;word-break:break-all}
   .att .size{color:var(--muted);margin-left:6px}
 
-  /* 시간/읽음 */
   .time{font-size:10px;color:#94a3b8;align-self:flex-end;min-width:34px;text-align:center;opacity:.9}
   .msg.me .time{margin-right:6px}
   .msg.them .time{margin-left:6px}
-  .read{font-size:10px;color:#94a3b8;align-self:flex-end;margin-left:6px;opacity:.95}
+  .unread{font-size:10px;color:#94a3b8;align-self:flex-end;margin-left:6px;opacity:.95;display:none}
 
-  /* Input bar */
   .inputbar{position:fixed;left:0;right:0;bottom:0;margin:0 auto;max-width:740px;background:rgba(255,255,255,.94);backdrop-filter:blur(8px);border-top:1px solid var(--border);padding:10px}
   .inputrow{display:flex;gap:8px;align-items:center}
   .textinput{flex:1;border:1px solid var(--border);border-radius:14px;padding:12px 12px;font:inherit}
@@ -212,7 +193,6 @@ app.get('/', (req, res) => {
   .btn-attach{background:#e2e8f0;color:var(--ink)}
   .btn-send{background:var(--accent);color:#fff}
 
-  /* Setup */
   .setup{padding:14px 14px 120px 14px;background:var(--chat-bg)}
   .panel{background:#fff;border:1px solid var(--border);border-radius:16px;padding:14px}
   .label{display:block;margin:10px 0 6px}
@@ -220,7 +200,6 @@ app.get('/', (req, res) => {
   .row{display:flex;gap:8px;margin-top:12px}
   .link{font-size:12px;color:var(--accent)}
 
-  /* Emoji panel */
   .emoji-panel{position:fixed;left:0;right:0;bottom:60px;margin:0 auto;max-width:740px;background:#fff7;backdrop-filter:blur(6px);border:1px solid var(--border);border-bottom:none;border-radius:14px 14px 0 0;box-shadow:0 -6px 24px var(--shadow-soft);}
   .emoji-tabs{display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border);background:#fff;border-radius:14px 14px 0 0}
   .emoji-tabs button{padding:6px 10px;border:1px solid rgba(2,6,23,.08);background:#f8fafc;border-radius:8px;cursor:pointer}
@@ -230,7 +209,6 @@ app.get('/', (req, res) => {
   .emoji button{font-size:20px;background:transparent;border:1px solid rgba(2,6,23,.06);border-radius:8px;cursor:pointer;padding:6px}
   .emoji button:hover{background:#fff}
 
-  /* Typing flag */
   .typing-flag{position:sticky;bottom:8px;left:0;display:none;align-items:center;gap:8px;background:#fff;border:1px solid rgba(14,165,233,.22);padding:6px 10px;border-radius:12px;color:var(--ink);font-size:12px;box-shadow:0 8px 24px var(--shadow-soft);max-width:70%}
   .typing-flag .who{font-weight:600;color:var(--accent)}
   .typing-flag .dots i{display:inline-block;width:4px;height:4px;background:#94a3b8;border-radius:50%;margin-left:3px;animation:dotBlink 1.2s infinite}
@@ -238,7 +216,6 @@ app.get('/', (req, res) => {
   .typing-flag .dots i:nth-child(3){animation-delay:.3s}
   @keyframes dotBlink{0%{opacity:.2}20%{opacity:1}100%{opacity:.2}}
 
-  /* Lightbox */
   .viewer{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(2,6,23,.7);z-index:50}
   .viewer.active{display:flex}
   .viewer .box{max-width:92vw;max-height:92vh;border-radius:12px;overflow:hidden;background:#000}
@@ -272,13 +249,11 @@ app.get('/', (req, res) => {
       <div class="divider"><div class="line"></div><div class="txt">오늘</div><div class="line"></div></div>
     </div>
 
-    <!-- Lightbox -->
     <div id="viewer" class="viewer" role="dialog" aria-modal="true">
       <div class="close" id="viewerClose" title="닫기">✕</div>
       <div class="box"><img id="viewerImg" alt=""></div>
     </div>
 
-    <!-- Emoji panel -->
     <div id="emojiPanel" class="emoji-panel" style="display:none">
       <div class="emoji-tabs">
         <button id="tabAnimals" class="active" type="button">동물</button>
@@ -288,7 +263,6 @@ app.get('/', (req, res) => {
       <div id="emojiGrid" class="emoji"></div>
     </div>
 
-    <!-- Input bar -->
     <div class="inputbar" id="inputbar" style="display:none">
       <div class="inputrow">
         <input id="text" class="textinput" type="text" placeholder="메시지를 입력하세요" />
@@ -300,7 +274,6 @@ app.get('/', (req, res) => {
       <div class="subtitle" style="margin-top:4px">Enter 전송 · 2MB 이하 첨부 지원</div>
     </div>
 
-    <!-- Setup -->
     <div id="setup" class="setup">
       <div class="panel">
         <label class="label">대화방 코드</label>
@@ -327,35 +300,22 @@ app.get('/', (req, res) => {
   var setup = $('#setup');
   var inputbar = $('#inputbar');
 
-  // Theme logic
+  // Theme
   var THEME_KEY='chat_theme';
   var themeSel = $('#themeSel');
   var brandTitle = $('#brandTitle');
   var brandIcon = $('#brandIcon');
   var statusIcon = $('#statusIcon');
-
   function applyTheme(t){
     document.documentElement.setAttribute('data-theme', t);
     localStorage.setItem(THEME_KEY, t);
-    if (t === 'fox'){
-      brandTitle.textContent = 'Fox Chat';
-      brandIcon.textContent = '🦊';
-      statusIcon.textContent = '🔥';
-    } else {
-      brandTitle.textContent = 'Cloud Cat Chat';
-      brandIcon.textContent = '🐱';
-      statusIcon.textContent = '☁️';
-    }
-    // 이모지 패널, 헤더 등은 CSS 변수로 자동 반영
+    if (t === 'fox'){ brandTitle.textContent='Fox Chat'; brandIcon.textContent='🦊'; statusIcon.textContent='🔥'; }
+    else { brandTitle.textContent='Cloud Cat Chat'; brandIcon.textContent='🐱'; statusIcon.textContent='☁️'; }
   }
   var savedTheme = localStorage.getItem(THEME_KEY) || 'cloud';
-  themeSel.value = savedTheme;
-  applyTheme(savedTheme);
+  themeSel.value = savedTheme; applyTheme(savedTheme);
   themeSel.onchange = function(){ applyTheme(themeSel.value); };
-
-  function peerEmoji(){
-    return (document.documentElement.getAttribute('data-theme') === 'fox') ? '🦊' : '🐾';
-  }
+  function peerEmoji(){ return (document.documentElement.getAttribute('data-theme') === 'fox') ? '🦊' : '🐾'; }
 
   // Lightbox
   var viewer = $('#viewer'), viewerImg = $('#viewerImg'), viewerClose = $('#viewerClose');
@@ -365,11 +325,10 @@ app.get('/', (req, res) => {
   viewerClose.addEventListener('click', closeViewer);
   window.addEventListener('keydown', function(e){ if(e.key==='Escape') closeViewer(); });
 
-  // Emoji panel
+  // Emoji
   var emojiPanel = $('#emojiPanel'), emojiGrid = $('#emojiGrid');
   var tabAnimals = $('#tabAnimals'), tabFeels = $('#tabFeels'), comboChk = $('#comboMode');
 
-  // Inputs
   var roomInput = $('#room'), nickInput = $('#nick'), keyInput = $('#key');
   var invite = $('#invite'), statusTag = $('#status'), online = $('#online');
   var fileInput = $('#file'), textInput = $('#text');
@@ -392,7 +351,7 @@ app.get('/', (req, res) => {
   function esc(s){ return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   function genId(){ return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
 
-  // Focus/visibility for read logic
+  // Read detection
   var hasFocus = document.hasFocus();
   var visible = document.visibilityState === 'visible';
   function isAttended(){ return hasFocus && visible; }
@@ -427,7 +386,7 @@ app.get('/', (req, res) => {
     });
   }
 
-  // Typing flag
+  // Typing indicator
   var typingFlag = document.createElement('div');
   typingFlag.className = 'typing-flag';
   typingFlag.innerHTML = '<span class="who"></span> 입력 중 <span class="dots"><i></i><i></i><i></i></span>';
@@ -442,7 +401,7 @@ app.get('/', (req, res) => {
   }
   function hideTyping(){ typingFlag.style.display = 'none'; }
 
-  // Message renderers
+  // Renderers
   function makeStack(){ var s = document.createElement('div'); s.className = 'stack'; return s; }
   function addMsg(fromMe, name, text, ts, id){
     var row = document.createElement('div'); row.className = 'msg ' + (fromMe? 'me':'them');
@@ -466,7 +425,7 @@ app.get('/', (req, res) => {
     row.appendChild(stack);
 
     if(fromMe){
-      var r = document.createElement('span'); r.className='read'; r.textContent='1'; row.appendChild(r);
+      var badge = document.createElement('span'); badge.className='unread'; badge.textContent=''; row.appendChild(badge);
     } else {
       var t2 = document.createElement('span'); t2.className='time'; t2.textContent = fmt(ts||Date.now()); row.appendChild(t2);
     }
@@ -511,7 +470,7 @@ app.get('/', (req, res) => {
     row.appendChild(stack);
 
     if(fromMe){
-      var r = document.createElement('span'); r.className='read'; r.textContent='1'; row.appendChild(r);
+      var badge = document.createElement('span'); badge.className='unread'; badge.textContent=''; row.appendChild(badge);
     } else {
       var t2 = document.createElement('span'); t2.className='time'; t2.textContent = fmt(file.ts||Date.now()); row.appendChild(t2);
     }
@@ -521,11 +480,10 @@ app.get('/', (req, res) => {
     if(!fromMe && id){ observer.observe(row); if(isAttended()) rescanUnread(); }
   }
 
-  // Emoji data & insertion (입력창 삽입)
+  // Emoji data & insertion
   var animals = ['🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼','🐨','🐯','🦁','🐮','🐷','🐸','🐵','🐔','🐧','🐦','🐤','🦆','🦅','🦉','🦇','🐺','🐗','🐴','🦄','🐝','🦋','🐛','🐞','🦖','🦕','🐢','🐍','🦎','🐙','🦑','🦀','🦞','🦐','🐠','🐟','🐡','🐬','🐳','🐋','🐊','🦧','🦍','🦝','🦨','🦦','🦥','🦘','🦡','🦢','🦩','🦚','🦜'];
   var feelings = ['❤️','💖','💕','✨','🔥','🎉','🥳','👍','👏','🤝','🤗','💪','🙂','😊','😂','🤣','🥹','🥺','😡','😎','😱','😘','🤩','😴','😭'];
   var currentTab = 'animals', comboMode = false, pickedAnimal = null;
-
   function insertAtCursor(input, s){
     input.focus();
     var start = input.selectionStart || input.value.length;
@@ -617,11 +575,21 @@ app.get('/', (req, res) => {
     socket.on('peer_joined', function(name){ addSys(name + ' 님이 입장했습니다'); });
     socket.on('peer_left', function(name){ addSys(name + ' 님이 퇴장했습니다'); });
 
-    socket.on('msg', function(payload){ var id = payload.id; addMsg(false, payload.nick, payload.text, payload.ts, id); if (id && isAttended()) sendRead(id); });
+    socket.on('msg', function(p){ var id = p.id; addMsg(false, p.nick, p.text, p.ts, id); if (id && isAttended()) sendRead(id); });
     socket.on('file', function(p){ var id = p.id; addFile(false, p.nick, { name: p.name, type: p.type, size: p.size, data: p.data, ts: p.ts }, id); if (id && isAttended()) sendRead(id); });
 
-    socket.on('read', function(p){ if (!p || !p.id) return; var row = document.querySelector('.msg.me[data-mid="'+p.id+'"]'); if (row){ var badge=row.querySelector('.read'); if(badge) badge.remove(); } });
+    // 안 읽은 사람 수 갱신
+    socket.on('unread', function(u){
+      // 내 메시지에만 뱃지 표시
+      var row = document.querySelector('.msg.me[data-mid="'+u.id+'"]');
+      if (!row) return;
+      var badge = row.querySelector('.unread');
+      if (!badge) return;
+      if (u.count > 0){ badge.textContent = String(u.count); badge.style.display = 'inline'; }
+      else { badge.remove(); }
+    });
 
+    // 타이핑
     socket.on('typing', function(p){ if (p && p.state){ showTyping(p.nick || '상대'); } else { hideTyping(); } });
 
     socket.on('ka', function(){});
@@ -693,7 +661,6 @@ app.get('/', (req, res) => {
 
   chatBox.addEventListener('scroll', function(){ if (isAttended()) rescanUnread(); });
 
-  // URL prefill
   var url = new URL(window.location);
   var r = url.searchParams.get('room');
   var n = url.searchParams.get('nick');
@@ -712,8 +679,8 @@ io.on('connection', (socket) => {
     if (!room || !nick) return socket.emit('join_error', '잘못된 파라미터');
 
     const r = getRoom(room);
-    if (r.users.size >= 2) return socket.emit('join_error', '이 방은 최대 2명만 입장할 수 있어요');
 
+    // 방 키 검증(첫 입장자는 키 설정, 이후는 검증)
     if (r.users.size === 0) {
       if (key) r.key = key;
     } else {
@@ -731,6 +698,7 @@ io.on('connection', (socket) => {
     socket.to(room).emit('peer_joined', nick);
   });
 
+  // 메시지
   socket.on('msg', ({ room, id, text }) => {
     room = sanitize(room, 40);
     id = sanitize(id, 64);
@@ -742,10 +710,19 @@ io.on('connection', (socket) => {
     if (isThrottled(r, socket.id)) return socket.emit('info', '메시지가 너무 빠릅니다. 잠시 후 다시 시도하세요.');
 
     r.lastMsgs.push({ t: now(), from: socket.id });
+
+    // 현재 방의 다른 사용자들을 "미열람"으로 세팅
+    const recipients = Array.from(r.users).filter(sid => sid !== socket.id);
+    r.unread.set(id, new Set(recipients));
+
+    // 다른 사람들한테 메시지 전달
     socket.to(room).emit('msg', { id, nick, text, ts: now() });
+
+    // 방 전체에 현재 미열람 수 방송(보낸 사람도 포함)
+    io.to(room).emit('unread', { id, count: recipients.length });
   });
 
-  // 파일 릴레이
+  // 파일
   const ALLOWED_TYPES = new Set(['image/png','image/jpeg','image/webp','image/gif','application/pdf','text/plain','application/zip','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/msword','application/vnd.openxmlformats-officedocument.presentationml.presentation','application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','application/vnd.ms-excel']);
   const MAX_BYTES = 2_000_000;
   const MAX_DATAURL = 7_000_000;
@@ -765,15 +742,27 @@ io.on('connection', (socket) => {
     if (typeof data !== 'string' || data.slice(0,5) !== 'data:' || data.length > MAX_DATAURL) return socket.emit('info', '파일 데이터가 올바르지 않습니다.');
     if (isThrottled(r, socket.id, 5, 15_000)) return socket.emit('info', '전송이 너무 빠릅니다. 잠시 후 다시 시도하세요.');
 
+    const recipients = Array.from(r.users).filter(sid => sid !== socket.id);
+    r.unread.set(id, new Set(recipients));
+
     socket.to(room).emit('file', { id, nick, name, type, size, data, ts: now() });
+    io.to(room).emit('unread', { id, count: recipients.length });
   });
 
-  // 읽음 중계
+  // 읽음 처리: 이 소켓이 메시지 id를 읽었다
   socket.on('read', ({ room, id }) => {
     room = sanitize(room, 40);
     id = sanitize(id, 64);
     if (!room || !id) return;
-    socket.to(room).emit('read', { id });
+    const r = rooms.get(room);
+    if (!r) return;
+    const set = r.unread.get(id);
+    if (!set) return;
+    if (set.delete(socket.id)) {
+      const count = set.size;
+      io.to(room).emit('unread', { id, count });
+      if (count === 0) r.unread.delete(id);
+    }
   });
 
   // 타이핑 중계
@@ -783,14 +772,26 @@ io.on('connection', (socket) => {
     socket.to(room).emit('typing', { nick, state: !!state });
   });
 
-  // keep-alive 응답
+  // keep-alive 에코
   socket.on('ka', () => { socket.emit('ka', Date.now()); });
 
+  // 연결 해제: 모든 미열람 세트에서 이 소켓 제거
   socket.on('disconnect', () => {
     const room = socket.data.room;
     const nick = socket.data.nick;
+
     if (room && rooms.has(room)) {
       const r = rooms.get(room);
+
+      // 미열람 세트 정리 및 방송
+      for (const [mid, set] of r.unread.entries()) {
+        if (set.delete(socket.id)) {
+          const count = set.size;
+          io.to(room).emit('unread', { id: mid, count });
+          if (count === 0) r.unread.delete(mid);
+        }
+      }
+
       r.users.delete(socket.id);
       socket.to(room).emit('peer_left', nick || '게스트');
       if (r.users.size === 0) rooms.delete(room);
@@ -800,5 +801,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log('1:1 chat running on http://localhost:' + PORT);
+  console.log('multi-user chat running on http://localhost:' + PORT);
 });
